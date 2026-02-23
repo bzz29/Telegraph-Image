@@ -1,155 +1,185 @@
 export async function onRequest(context) {
-    const {
-        request,
-        env,
-        params,
-    } = context;
+  const { request, env, params } = context;
 
-    const url = new URL(request.url);
-    let fileUrl = 'https://telegra.ph/' + url.pathname + url.search
-    if (url.pathname.length > 39) { // Path length > 39 indicates file uploaded via Telegram Bot API
-        const formdata = new FormData();
-        formdata.append("file_id", url.pathname);
+  const url = new URL(request.url);
+  const seg = decodeURIComponent(String(params?.id || "")).trim(); // e.g. AgAC...BA.png
+  const segNoExt = seg.replace(/\.[A-Za-z0-9]{1,10}$/i, ""); // remove .png/.jpg...
 
-        const requestOptions = {
-            method: "POST",
-            body: formdata,
-            redirect: "follow"
-        };
-        // /file/AgACAgEAAxkDAAMDZt1Gzs4W8dQPWiQJxO5YSH5X-gsAAt-sMRuWNelGOSaEM_9lHHgBAAMCAANtAAM2BA.png
-        //get the AgACAgEAAxkDAAMDZt1Gzs4W8dQPWiQJxO5YSH5X-gsAAt-sMRuWNelGOSaEM_9lHHgBAAMCAANtAAM2BA
-        console.log(url.pathname.split(".")[0].split("/")[2])
-        const filePath = await getFilePath(env, url.pathname.split(".")[0].split("/")[2]);
-        console.log(filePath)
-        fileUrl = `https://api.telegram.org/file/bot${env.TG_Bot_Token}/${filePath}`;
+  // 默认走 telegra.ph（Telegraph 老链）
+  let upstreamUrl = "https://telegra.ph" + url.pathname + url.search;
+
+  // Telegram Bot API 文件：通常 file_id 很长（你之前用 length>39 判断，我保留但更稳一点）
+  const looksLikeTgFileId = segNoExt.length > 39 && /^[A-Za-z0-9_-]+$/.test(segNoExt);
+
+  if (looksLikeTgFileId) {
+    const token = env?.TG_Bot_Token ? String(env.TG_Bot_Token).trim() : "";
+    if (token) {
+      const filePath = await getFilePath(env, segNoExt);
+      if (filePath) {
+        upstreamUrl = `https://api.telegram.org/file/bot${token}/${filePath}`;
+      }
     }
+  }
 
-    const response = await fetch(fileUrl, {
-        method: request.method,
-        headers: request.headers,
-        body: request.body,
-    });
+  // 只透传必要请求头（避免把一堆不相关 header 转发给上游）
+  const upstreamHeaders = new Headers();
+  const range = request.headers.get("Range");
+  if (range) upstreamHeaders.set("Range", range);
 
-    // If the response is OK, proceed with further checks
-    if (!response.ok) return response;
+  // GET/HEAD 不要带 body（CF fetch 对 GET 带 body 有时会出问题）
+  const method = request.method.toUpperCase();
+  const init =
+    method === "GET" || method === "HEAD"
+      ? { method, headers: upstreamHeaders }
+      : { method, headers: upstreamHeaders, body: request.body };
 
-    // Log response details
-    console.log(response.ok, response.status);
+  const upstream = await fetch(upstreamUrl, init);
+  if (!upstream.ok) return upstream;
 
-    // Allow the admin page to directly view the image
-    const isAdmin = request.headers.get('Referer')?.includes(`${url.origin}/admin`);
-    if (isAdmin) {
-        return response;
-    }
+  // ✅ 统一把返回变成“可预览图片”（inline + image/*）
+  const inlineResponse = asInlineImage(upstream, url.pathname);
 
-    // Check if KV storage is available
-    if (!env.img_url) {
-        console.log("KV storage not available, returning image directly");
-        return response;  // Directly return image response, terminate execution
-    }
+  // admin 页面也应该能预览（否则还是下载）
+  const isAdmin = request.headers.get("Referer")?.includes(`${url.origin}/admin`);
+  if (isAdmin) return inlineResponse;
 
-    // The following code executes only if KV is available
-    let record = await env.img_url.getWithMetadata(params.id);
-    if (!record || !record.metadata) {
-        // Initialize metadata if it doesn't exist
-        console.log("Metadata not found, initializing...");
-        record = {
-            metadata: {
-                ListType: "None",
-                Label: "None",
-                TimeStamp: Date.now(),
-                liked: false,
-                fileName: params.id,
-                fileSize: 0,
-            }
-        };
-        await env.img_url.put(params.id, "", { metadata: record.metadata });
-    }
+  // 没 KV 就直接返回图片
+  if (!env.img_url) return inlineResponse;
 
-    const metadata = {
-        ListType: record.metadata.ListType || "None",
-        Label: record.metadata.Label || "None",
-        TimeStamp: record.metadata.TimeStamp || Date.now(),
-        liked: record.metadata.liked !== undefined ? record.metadata.liked : false,
-        fileName: record.metadata.fileName || params.id,
-        fileSize: record.metadata.fileSize || 0,
+  // KV 元数据
+  let record = await env.img_url.getWithMetadata(params.id);
+  if (!record || !record.metadata) {
+    record = {
+      metadata: {
+        ListType: "None",
+        Label: "None",
+        TimeStamp: Date.now(),
+        liked: false,
+        fileName: params.id,
+        fileSize: 0,
+      },
     };
+    await env.img_url.put(params.id, "", { metadata: record.metadata });
+  }
 
-    // Handle based on ListType and Label
-    if (metadata.ListType === "White") {
-        return response;
-    } else if (metadata.ListType === "Block" || metadata.Label === "adult") {
-        const referer = request.headers.get('Referer');
-        const redirectUrl = referer ? "https://static-res.pages.dev/teleimage/img-block-compressed.png" : `${url.origin}/block-img.html`;
-        return Response.redirect(redirectUrl, 302);
-    }
+  const metadata = {
+    ListType: record.metadata.ListType || "None",
+    Label: record.metadata.Label || "None",
+    TimeStamp: record.metadata.TimeStamp || Date.now(),
+    liked: record.metadata.liked !== undefined ? record.metadata.liked : false,
+    fileName: record.metadata.fileName || params.id,
+    fileSize: record.metadata.fileSize || getContentLength(upstream) || 0,
+  };
 
-    // Check if WhiteList_Mode is enabled
-    if (env.WhiteList_Mode === "true") {
-        return Response.redirect(`${url.origin}/whitelist-on.html`, 302);
-    }
-
-    // If no metadata or further actions required, moderate content and add to KV if needed
-    if (env.ModerateContentApiKey) {
-        try {
-            console.log("Starting content moderation...");
-            const moderateUrl = `https://api.moderatecontent.com/moderate/?key=${env.ModerateContentApiKey}&url=https://telegra.ph${url.pathname}${url.search}`;
-            const moderateResponse = await fetch(moderateUrl);
-
-            if (!moderateResponse.ok) {
-                console.error("Content moderation API request failed: " + moderateResponse.status);
-            } else {
-                const moderateData = await moderateResponse.json();
-                console.log("Content moderation results:", moderateData);
-
-                if (moderateData && moderateData.rating_label) {
-                    metadata.Label = moderateData.rating_label;
-
-                    if (moderateData.rating_label === "adult") {
-                        console.log("Content marked as adult, saving metadata and redirecting");
-                        await env.img_url.put(params.id, "", { metadata });
-                        return Response.redirect(`${url.origin}/block-img.html`, 302);
-                    }
-                }
-            }
-        } catch (error) {
-            console.error("Error during content moderation: " + error.message);
-            // Moderation failure should not affect user experience, continue processing
-        }
-    }
-
-    // Only save metadata if content is not adult content
-    // Adult content cases are already handled above and will not reach this point
-    console.log("Saving metadata");
+  if (metadata.ListType === "White") {
     await env.img_url.put(params.id, "", { metadata });
+    return inlineResponse;
+  }
 
-    // Return file content
-    return response;
+  if (metadata.ListType === "Block" || metadata.Label === "adult") {
+    const referer = request.headers.get("Referer");
+    const redirectUrl = referer
+      ? "https://static-res.pages.dev/teleimage/img-block-compressed.png"
+      : `${url.origin}/block-img.html`;
+    return Response.redirect(redirectUrl, 302);
+  }
+
+  if (env.WhiteList_Mode === "true") {
+    return Response.redirect(`${url.origin}/whitelist-on.html`, 302);
+  }
+
+  // 内容审查：只有 telegra.ph 链接才去审查（Telegram file 链接审查通常会失败/没意义）
+  if (env.ModerateContentApiKey && upstreamUrl.startsWith("https://telegra.ph/")) {
+    try {
+      const moderateUrl = `https://api.moderatecontent.com/moderate/?key=${env.ModerateContentApiKey}&url=${encodeURIComponent(
+        upstreamUrl
+      )}`;
+      const moderateRes = await fetch(moderateUrl);
+      if (moderateRes.ok) {
+        const moderateData = await moderateRes.json();
+        if (moderateData?.rating_label) {
+          metadata.Label = moderateData.rating_label;
+          if (metadata.Label === "adult") {
+            await env.img_url.put(params.id, "", { metadata });
+            return Response.redirect(`${url.origin}/block-img.html`, 302);
+          }
+        }
+      }
+    } catch {
+      // 审查失败不影响正常访问
+    }
+  }
+
+  await env.img_url.put(params.id, "", { metadata });
+  return inlineResponse;
+}
+
+function asInlineImage(upstream, pathname) {
+  const headers = new Headers(upstream.headers);
+
+  // ✅ 关键：把下载附件改成内联预览
+  headers.set("Content-Disposition", "inline");
+
+  // ✅ 关键：确保 Content-Type 是 image/*
+  const guessed = guessContentType(pathname);
+  const ct = (headers.get("Content-Type") || "").toLowerCase();
+  if (guessed) {
+    if (!ct.startsWith("image/") || ct.includes("octet-stream")) {
+      headers.set("Content-Type", guessed);
+    }
+  }
+
+  headers.set("X-Content-Type-Options", "nosniff");
+
+  return new Response(upstream.body, {
+    status: upstream.status,
+    statusText: upstream.statusText,
+    headers,
+  });
+}
+
+function guessContentType(pathname) {
+  const ext = (String(pathname).split(".").pop() || "").toLowerCase();
+  switch (ext) {
+    case "jpg":
+    case "jpeg":
+      return "image/jpeg";
+    case "png":
+      return "image/png";
+    case "gif":
+      return "image/gif";
+    case "webp":
+      return "image/webp";
+    case "bmp":
+      return "image/bmp";
+    case "svg":
+      return "image/svg+xml";
+    case "ico":
+      return "image/x-icon";
+    default:
+      return "";
+  }
+}
+
+function getContentLength(res) {
+  const v = res.headers.get("content-length");
+  const n = v ? parseInt(v, 10) : 0;
+  return Number.isFinite(n) ? n : 0;
 }
 
 async function getFilePath(env, file_id) {
-    try {
-        const url = `https://api.telegram.org/bot${env.TG_Bot_Token}/getFile?file_id=${file_id}`;
-        const res = await fetch(url, {
-            method: 'GET',
-        });
+  try {
+    const token = env?.TG_Bot_Token ? String(env.TG_Bot_Token).trim() : "";
+    if (!token) return null;
 
-        if (!res.ok) {
-            console.error(`HTTP error! status: ${res.status}`);
-            return null;
-        }
+    const api = `https://api.telegram.org/bot${token}/getFile?file_id=${encodeURIComponent(file_id)}`;
+    const res = await fetch(api, { method: "GET" });
+    if (!res.ok) return null;
 
-        const responseData = await res.json();
-        const { ok, result } = responseData;
-
-        if (ok && result) {
-            return result.file_path;
-        } else {
-            console.error('Error in response data:', responseData);
-            return null;
-        }
-    } catch (error) {
-        console.error('Error fetching file path:', error.message);
-        return null;
-    }
+    const data = await res.json();
+    if (data?.ok && data?.result?.file_path) return data.result.file_path;
+    return null;
+  } catch {
+    return null;
+  }
 }
